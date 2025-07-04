@@ -1,0 +1,376 @@
+// ==UserScript==
+// @name         Api Maker v2.1 (Configurável)
+// @namespace    http://tampermonkey.net/
+// @version      2.1
+// @description  Pressione o atalho (padrão: Ctrl+Alt+A) para ativar. Captura APIs, inspeciona scripts e permite customização.
+// @author       naughtyyjohn e darkuslight
+// @match        *://*/*
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+
+    let settings = {
+        hotkey: {
+            ctrl: true,
+            alt: true,
+            shift: false,
+            key: 'a'
+        },
+        panelColor: '#00ff00'
+    };
+
+    function saveSettings() {
+        try {
+            localStorage.setItem('apiMonitorSettings', JSON.stringify(settings));
+        } catch (e) {
+            console.error("Api Maker v2.1: Falha ao salvar configurações.", e);
+        }
+    }
+
+    function loadSettings() {
+        try {
+            const saved = localStorage.getItem('apiMonitorSettings');
+            if (saved) {
+                settings = JSON.parse(saved);
+            }
+        } catch (e) {
+            console.error("Api Maker v2.1: Falha ao carregar configurações. Usando padrões.", e);
+        }
+    }
+
+    loadSettings();
+
+
+
+    function initializeMonitor() {
+        if (document.getElementById('api-capture-panel')) {
+            console.log("Api Maker v2.1 já está ativo.");
+            return;
+        }
+
+        console.log("✅ Api Maker v2.1 Ativado.");
+
+        const apiLog = [];
+        const scriptCache = {};
+        const originalFetch = window.fetch;
+        const originalXHROpen = XMLHttpRequest.prototype.open;
+        const originalXHRSend = XMLHttpRequest.prototype.send;
+
+        function parseUrlFromStackLine(line) {
+            if (!line) return null;
+            const match = line.match(/(?:at\s.*\s|@)?(https?:\/\/[^\s\)]+):\d+:\d+/);
+            return match ? match[1] : null;
+        }
+
+        function getInitiatorUrl() {
+            try {
+                const stack = new Error().stack;
+                if (typeof stack !== 'string') return null;
+                const stackLines = stack.split('\n');
+                for (let i = 3; i < stackLines.length; i++) {
+                    const url = parseUrlFromStackLine(stackLines[i]);
+                    if (url) return url;
+                }
+            } catch (e) {
+                console.error("Erro ao obter a URL do iniciador:", e);
+            }
+            return null;
+        }
+
+        async function getScriptSource(url) {
+            if (!url) {
+                return "Origem não é um script externo ou não pôde ser determinada.";
+            }
+            if (scriptCache[url]) {
+                return scriptCache[url];
+            }
+            try {
+                const response = await originalFetch(url);
+                if (!response.ok) throw new Error(`Erro HTTP! status: ${response.status}`);
+                const text = await response.text();
+                scriptCache[url] = text;
+                return text;
+            } catch (e) {
+                const errorMessage = `Falha ao buscar o script (pode ser um problema de CORS ou o arquivo não está acessível).\nURL: ${url}`;
+                scriptCache[url] = errorMessage;
+                return errorMessage;
+            }
+        }
+
+        function createPanel() {
+            const panel = document.createElement('div');
+            panel.id = 'api-capture-panel';
+            panel.style = `position:fixed;bottom:10px;right:-550px;width:520px;max-height:80vh;display:flex;flex-direction:column;z-index:99999;background:#121212;color:${settings.panelColor};border:2px solid ${settings.panelColor};font-family:monospace;font-size:13px;border-radius:8px;box-shadow:0 0 15px ${settings.panelColor};transition:all 0.5s ease;`;                                                                                                                                                                              //johnbobão
+
+            const header = document.createElement('div');
+            header.style = `padding:10px;font-weight:bold;display:flex;justify-content:space-between;align-items:center;text-shadow:0 0 5px ${settings.panelColor};border-bottom: 1px solid ${settings.panelColor};`;
+            header.innerHTML = `<span>📡 <span class="glowing-text">PAINEL DE ANÁLISE</span></span>`;
+            const hideBtn = document.createElement('button');
+            hideBtn.textContent = '[X]';
+            hideBtn.style = 'cursor:pointer;background:#f00;color:#fff;border:none;padding:2px 6px;border-radius:4px;font-weight:bold;';
+            hideBtn.onclick = () => {
+                panel.style.right = '-550px';
+                setTimeout(() => { panel.remove(); }, 500);
+            };
+            header.appendChild(hideBtn);
+            panel.appendChild(header);
+
+            const tabContainer = document.createElement('div');
+            tabContainer.style = 'display:flex; background: #2a2a2a;';
+            const apiTab = document.createElement('button');
+            apiTab.textContent = 'Monitor APIs';
+            apiTab.className = 'api-panel-tab active';
+            const scriptTab = document.createElement('button');
+            scriptTab.textContent = 'Inspecionar Scripts';
+            scriptTab.className = 'api-panel-tab';
+            const settingsTab = document.createElement('button');
+            settingsTab.textContent = 'Configurações';
+            settingsTab.className = 'api-panel-tab';
+            tabContainer.appendChild(apiTab);
+            tabContainer.appendChild(scriptTab);
+            tabContainer.appendChild(settingsTab);
+            panel.appendChild(tabContainer);
+
+            const contentContainer = document.createElement('div');
+            contentContainer.style = 'flex-grow:1; overflow-y:auto; padding:10px;';
+
+            const apiContent = document.createElement('div');
+            apiContent.id = 'api-log-content';
+
+            const scriptContent = document.createElement('div');
+            scriptContent.id = 'script-inspector-content';
+            scriptContent.style.display = 'none';
+            scriptContent.innerHTML = '<p>Clique no botão para carregar os scripts da página.</p><button id="load-scripts-btn" class="api-panel-tab" style="width:100%; margin-top:10px;">Carregar Scripts</button>';
+
+            const settingsContent = document.createElement('div');
+            settingsContent.id = 'settings-content';
+            settingsContent.style.display = 'none';
+            createSettingsInterface(settingsContent); 
+
+            contentContainer.appendChild(apiContent);
+            contentContainer.appendChild(scriptContent);
+            contentContainer.appendChild(settingsContent);
+            panel.appendChild(contentContainer);
+
+            const footer = document.createElement('div');
+            footer.style = `padding: 5px; text-align: center; font-size: 10px; border-top: 1px solid ${settings.panelColor}; color: #888;`;
+            footer.innerHTML = 'Desenvolvido por: <strong>naughtyyjohn</strong> & <strong>darkuslight</strong>';
+            panel.appendChild(footer);
+
+            function switchTab(activeTab, activeContent) {
+                 [apiTab, scriptTab, settingsTab].forEach(tab => tab.classList.remove('active'));
+                 [apiContent, scriptContent, settingsContent].forEach(content => content.style.display = 'none');
+                 activeTab.classList.add('active');
+                 activeContent.style.display = 'block';
+            }
+            apiTab.onclick = () => switchTab(apiTab, apiContent);
+            scriptTab.onclick = () => switchTab(scriptTab, scriptContent);
+            settingsTab.onclick = () => switchTab(settingsTab, settingsContent);
+
+            const style = document.createElement('style');
+            style.id = 'api-monitor-dynamic-styles';
+            function updateStyles() {
+                style.textContent = `
+                    #api-capture-panel {
+                        color: ${settings.panelColor};
+                        border-color: ${settings.panelColor};
+                        box-shadow: 0 0 15px ${settings.panelColor};
+                    }
+                    .glowing-text {
+                        color: ${settings.panelColor};
+                        animation: glow 1s ease-in-out infinite alternate;
+                    }
+                    @keyframes glow {
+                       from { text-shadow: 0 0 5px ${settings.panelColor}; }
+                       to { text-shadow: 0 0 20px ${settings.panelColor}; }
+                    }
+                    .api-panel-tab { background: #333; color: ${settings.panelColor}; border: 1px solid ${settings.panelColor}; padding: 8px; cursor: pointer; flex-grow: 1; transition: background 0.3s, color 0.3s; }
+                    .api-panel-tab.active { background: ${settings.panelColor}; color: #121212; font-weight: bold; }
+                    .api-panel-tab:hover { background: #444; }
+                    .api-panel-tab.active:hover { background: ${settings.panelColor}; }
+                    #api-capture-panel .collapsible-section { border: 1px solid ${settings.panelColor}33; border-radius: 5px; margin: 8px 0; }
+                    #api-capture-panel .collapsible-summary { cursor:pointer; padding:4px 8px; background: ${settings.panelColor}22; color:${settings.panelColor}; font-weight:bold; user-select:none; border-radius:4px; display:flex; justify-content:space-between; align-items:center;}
+                    #api-capture-panel .collapsible-content { margin:0; padding:8px; max-height:250px; overflow:auto; background:#222; white-space:pre-wrap; word-break:break-all; font-size:12px; border-top: 1px solid ${settings.panelColor}33; }
+                    #api-capture-panel .settings-row { display: flex; align-items: center; margin-bottom: 12px; }
+                    #api-capture-panel .settings-row label { flex-basis: 150px; }
+                    #api-capture-panel .settings-row input[type="color"] { border: none; background: transparent; width: 50px; height: 30px; cursor: pointer; }
+                    #api-capture-panel .settings-row input[type="checkbox"] { margin-right: 5px; }
+                    #api-capture-panel .settings-row input[type="text"] { background: #333; border: 1px solid ${settings.panelColor}; color: ${settings.panelColor}; padding: 4px; border-radius: 4px; width: 50px; text-align: center; }
+                    #api-capture-panel .save-btn { width: 100%; padding: 10px; margin-top: 10px; border-radius: 5px; }
+                `;
+            }
+            updateStyles(); 
+            panel.appendChild(style);
+
+            document.body.appendChild(panel);
+            setTimeout(() => { panel.style.right = '10px'; }, 100);
+
+            document.getElementById('load-scripts-btn').onclick = function() {
+                this.textContent = 'Carregando...';
+                this.disabled = true;
+                populateScriptInspector();
+            };
+        }
+
+        function createSettingsInterface(container) {
+            container.innerHTML = '<h3>Configurações do Painel</h3>';
+
+            const colorRow = document.createElement('div');
+            colorRow.className = 'settings-row';
+            colorRow.innerHTML = `<label>Cor do Painel:</label>`;
+            const colorPicker = document.createElement('input');
+            colorPicker.type = 'color';
+            colorPicker.value = settings.panelColor;
+            colorPicker.addEventListener('input', (e) => {
+                settings.panelColor = e.target.value;
+                const panel = document.getElementById('api-capture-panel');
+                if(panel) {
+                   panel.style.borderColor = settings.panelColor;
+                   panel.style.color = settings.panelColor;
+                   panel.style.boxShadow = `0 0 15px ${settings.panelColor}`;
+                   panel.querySelector('.glowing-text').style.color = settings.panelColor;
+                   panel.querySelector('.glowing-text').style.textShadow = `0 0 5px ${settings.panelColor}`;
+                   panel.querySelector('div[style*="border-top"]').style.borderColor = settings.panelColor;
+                   document.getElementById('api-monitor-dynamic-styles').textContent = document.getElementById('api-monitor-dynamic-styles').textContent.replace(/#[0-9a-f]{6}/ig, settings.panelColor);
+                }
+            });
+            colorRow.appendChild(colorPicker);
+            container.appendChild(colorRow);
+
+             const hotkeyRow = document.createElement('div');
+             hotkeyRow.className = 'settings-row';
+             hotkeyRow.innerHTML = `<label>Atalho de Ativação:</label>`;
+             const ctrlCheck = document.createElement('input');
+             ctrlCheck.type = 'checkbox'; ctrlCheck.checked = settings.hotkey.ctrl;
+             const altCheck = document.createElement('input');
+             altCheck.type = 'checkbox'; altCheck.checked = settings.hotkey.alt;
+             const shiftCheck = document.createElement('input');
+             shiftCheck.type = 'checkbox'; shiftCheck.checked = settings.hotkey.shift;
+             const keyInput = document.createElement('input');
+             keyInput.type = 'text'; keyInput.value = settings.hotkey.key; keyInput.maxLength = 1;
+
+             hotkeyRow.append(ctrlCheck, 'Ctrl + ', altCheck, 'Alt + ', shiftCheck, 'Shift + ', keyInput);
+             container.appendChild(hotkeyRow);
+
+            const saveBtn = document.createElement('button');
+            saveBtn.textContent = 'Salvar e Recarregar';
+            saveBtn.className = 'api-panel-tab save-btn';
+            saveBtn.onclick = () => {
+                settings.hotkey.ctrl = ctrlCheck.checked;
+                settings.hotkey.alt = altCheck.checked;
+                settings.hotkey.shift = shiftCheck.checked;
+                settings.hotkey.key = keyInput.value.toLowerCase();
+                saveSettings();
+                alert('Configurações salvas! A página será recarregada para aplicar o novo atalho.');
+                window.location.reload();
+            };
+            container.appendChild(saveBtn);
+        }
+
+        function createToggleSection(title, content) {
+            const container = document.createElement('div');
+            container.className = 'collapsible-section';
+            const details = document.createElement('details');
+            const summary = document.createElement('summary');
+            summary.className = 'collapsible-summary';
+            summary.textContent = title;
+            const pre = document.createElement('pre');
+            pre.className = 'collapsible-content';
+            pre.textContent = content || 'Nenhum';
+            details.appendChild(summary);
+            details.appendChild(pre);
+            container.appendChild(details);
+            return container;
+        }
+
+        async function logAPI(data) {
+            const apiContent = document.getElementById('api-log-content');
+            if (!apiContent) return;
+
+            apiLog.push(data);
+            const entry = document.createElement('div');
+            entry.style = 'margin:8px 0;padding:5px;border:1px solid #333;border-radius:6px;background:#1a1a1a;';
+            const sourceCode = await getScriptSource(data.initiatorUrl);
+            entry.appendChild(createToggleSection(`[${data.type.toUpperCase()}] ${data.method}: ${data.url}`,
+                `HEADERS:\n${formatHeaders(data.headers || {})}\n\nBODY:\n${prettyPrintJSON(data.body)}\n\nTOKEN: ${data.token || 'Nenhum'}`
+            ));
+            entry.appendChild(createToggleSection('Código Fonte da Origem (Tentativa)', sourceCode));
+            apiContent.insertBefore(entry, apiContent.firstChild);
+        }
+
+        function prettyPrintJSON(json) { try { return JSON.stringify(typeof json === 'string' ? JSON.parse(json) : json, null, 2); } catch { return json || 'Nenhum'; } }
+        function formatHeaders(headers) { let str = ''; for (const k in headers) { str += `${k}: ${headers[k]}\n`; } return str.trim() || 'Nenhum'; }
+        function extractToken(headers) { for (const k of ['authorization', 'x-api-key', 'x-auth-token', 'token']) { if (headers[k]) return headers[k]; } return null; }
+
+        function populateScriptInspector() {
+            const container = document.getElementById('script-inspector-content');
+            container.innerHTML = '';
+            const scripts = document.querySelectorAll('script');
+            container.innerHTML += `<p>Encontrados ${scripts.length} scripts:</p>`;
+
+            scripts.forEach((script, index) => {
+                const url = script.src;
+                const title = url ? `Externo: ${url.split('/').pop().split('?')[0] || url}` : `Script Inline #${index + 1}`;
+                const entry = document.createElement('div');
+                entry.className = 'collapsible-section';
+                const details = document.createElement('details');
+                const summary = document.createElement('summary');
+                summary.className = 'collapsible-summary';
+                summary.textContent = title;
+                const pre = document.createElement('pre');
+                pre.className = 'collapsible-content';
+                pre.textContent = 'Clique para carregar o código...';
+                details.appendChild(summary);
+                details.appendChild(pre);
+                entry.appendChild(details);
+                container.appendChild(entry);
+
+                summary.addEventListener('click', async () => {
+                    if (pre.textContent !== 'Clique para carregar o código...') return;
+                    pre.textContent = 'Carregando...';
+                    if (url) {
+                        pre.textContent = await getScriptSource(url);
+                    } else {
+                        pre.textContent = script.innerHTML || "Este script inline está vazio.";
+                    }
+                }, { once: true });
+            });
+        }
+
+        window.fetch = function(...args) {
+            logAPI({ type: 'fetch', method: (args[1]?.method || 'GET'), url: args[0], body: args[1]?.body, headers: args[1]?.headers, token: extractToken(args[1]?.headers || {}), initiatorUrl: getInitiatorUrl() });
+            return originalFetch.apply(this, args);
+        };
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this._method = method; this._url = url; this._initiatorUrl = getInitiatorUrl();
+            originalXHROpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function(body) {
+            this.addEventListener('load', () => {
+                logAPI({ type: 'xhr', method: this._method, url: this._url, body: body, headers: {}, token: null, initiatorUrl: this._initiatorUrl });
+            });
+            originalXHRSend.apply(this, arguments);
+        };
+
+        createPanel();
+        const alertBox = document.createElement('div');
+        alertBox.style = `position:fixed;top:20px;right:20px;padding:15px;background:#121212;color:${settings.panelColor};border:2px solid ${settings.panelColor};border-radius:8px;z-index:100001;box-shadow: 0 0 15px ${settings.panelColor};`;
+        alertBox.innerHTML = '<strong>✅ Api Maker v2.1!</strong>';
+        document.body.appendChild(alertBox);
+        setTimeout(() => { alertBox.remove(); }, 3000);
+    }
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key.toLowerCase() === settings.hotkey.key && e.ctrlKey === settings.hotkey.ctrl && e.altKey === settings.hotkey.alt && e.shiftKey === settings.hotkey.shift) {
+            e.preventDefault();
+            initializeMonitor();
+        }
+    });
+
+    console.log(`Api Maker v2.1 aguardando ativação (Pressione ${settings.hotkey.ctrl ? 'Ctrl+' : ''}${settings.hotkey.alt ? 'Alt+' : ''}${settings.hotkey.shift ? 'Shift+' : ''}${settings.hotkey.key.toUpperCase()}).`);
+
+})();
